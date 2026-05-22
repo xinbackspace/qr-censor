@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>可逆ノイズツール (D&D・残像修正版)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #f0f2f5; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .tabs { display: flex; border-bottom: 2px solid #ccc; margin-bottom: 20px; }
+        .tab { padding: 10px 20px; cursor: pointer; border: none; background: none; font-size: 16px; font-weight: bold; }
+        .tab.active { border-bottom: 3px solid #007bff; color: #007bff; }
+        .panel { display: none; }
+        .panel.active { display: block; }
+        .drop-zone { border: 2px dashed #007bff; padding: 30px; text-align: center; background: #f8fafc; cursor: pointer; border-radius: 6px; margin-bottom: 15px; transition: background 0.2s; }
+        .drop-zone.dragover { background: #e0f0ff; border-color: #0056b3; }
+        .canvas-container { position: relative; display: inline-block; max-width: 100%; margin-top: 15px; overflow: auto; border: 1px solid #ddd; }
+        canvas { display: block; max-width: 100%; height: auto; }
+        .controls { margin-top: 15px; text-align: center; }
+        button { background: #007bff; color: white; border: none; padding: 12px 25px; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        .info-text { font-size: 13px; color: #666; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>可逆ノイズ・プライバシーマスク</h2>
+    
+    <div class="tabs">
+        <button class="tab active" onclick="switchTab('encrypt-panel')">【パターンA】ノイズ化＋QR埋め込み</button>
+        <button class="tab" onclick="switchTab('decrypt-panel')">【パターンB】画像から完全復元</button>
+    </div>
+
+    <!-- パターンA -->
+    <div id="encrypt-panel" class="panel active">
+        <div class="drop-zone" id="drop-zone-A" onclick="document.getElementById('file-A').click()">
+            ここにPNG画像をドロップ、またはクリックして選択
+            <input type="file" id="file-A" accept="image/png" style="display:none" onchange="handleFileA(this.files[0])">
+        </div>
+        
+        <div class="canvas-container">
+            <canvas id="canvas-A"></canvas>
+        </div>
+
+        <div class="controls" id="controls-A" style="display:none;">
+            <button onclick="processEncrypt()">自動ノイズ化してPNGを保存</button>
+        </div>
+    </div>
+
+    <!-- パターンB -->
+    <div id="decrypt-panel" class="panel">
+        <div class="drop-zone" id="drop-zone-B" onclick="document.getElementById('file-B').click()">
+            ここに加工済みのPNG画像をドロップ、またはクリックして選択
+            <input type="file" id="file-B" accept="image/png" style="display:none" onchange="handleFileB(this.files[0])">
+        </div>
+        
+        <div class="canvas-container">
+            <canvas id="canvas-B"></canvas>
+        </div>
+    </div>
+</div>
+
+<script>
+    function switchTab(panelId) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        event.target.classList.add('active');
+        document.getElementById(panelId).classList.add('active');
+    }
+
+    const FIXED_SEED = "compliance_mask_system_2026_meta";
+
+    function createPRNG(seedStr) {
+        let h = 2166136261 >>> 0;
+        for (let i = 0; i < seedStr.length; i++) {
+            h = Math.imul(h ^ seedStr.charCodeAt(i), 16777619);
+        }
+        return function() {
+            let t = h += 0x6D2B79F5;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        }
+    }
+
+    // ドラッグ＆ドロップの標準動作をキャンセルする共通処理
+    function setupDropZone(zoneId, callback) {
+        const zone = document.getElementById(zoneId);
+        
+        ['dragenter', 'dragover'].forEach(eventName => {
+            zone.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                zone.classList.add('dragover');
+            }, false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            zone.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                zone.classList.remove('dragover');
+            }, false);
+        });
+
+        zone.addEventListener('drop', (e) => {
+            const dt = e.dataTransfer;
+            const files = dt.files;
+            if (files.length > 0) {
+                callback(files[0]);
+            }
+        }, false);
+    }
+
+    // 画面ロード時にD&Dイベントを登録
+    window.addEventListener('DOMContentLoaded', () => {
+        setupDropZone('drop-zone-A', handleFileA);
+        setupDropZone('drop-zone-B', handleFileB);
+    });
+
+    // パターンA管理オブジェクト
+    const canvasA = document.getElementById('canvas-A');
+    const ctxA = canvasA.getContext('2d');
+    
+    let rawCanvas = document.createElement('canvas');
+    let rawCtx = rawCanvas.getContext('2d');
+    
+    let isDrawing = false;
+    let startX, startY;
+    let rectX = 0, rectY = 0, rectW = 0, rectH = 0;
+
+    const QR_FIXED_SIZE = 150;
+
+    function handleFileA(file) {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const img = new Image();
+            img.onload = function() {
+                canvasA.width = img.width;
+                canvasA.height = img.height;
+                rawCanvas.width = img.width;
+                rawCanvas.height = img.height;
+                
+                rawCtx.drawImage(img, 0, 0);
+                ctxA.drawImage(rawCanvas, 0, 0);
+                
+                document.getElementById('controls-A').style.display = 'block';
+                initCanvasEvents();
+            };
+            img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    function initCanvasEvents() {
+        canvasA.onmousedown = (e) => {
+            const rect = canvasA.getBoundingClientRect();
+            startX = (e.clientX - rect.left) * (canvasA.width / rect.width);
+            startY = (e.clientY - rect.top) * (canvasA.height / rect.height);
+            isDrawing = true;
+        };
+        
+        canvasA.onmousemove = (e) => {
+            if (!isDrawing) return;
+            const rect = canvasA.getBoundingClientRect();
+            const currX = (e.clientX - rect.left) * (canvasA.width / rect.width);
+            const currY = (e.clientY - rect.top) * (canvasA.height / rect.height);
+            
+            ctxA.clearRect(0, 0, canvasA.width, canvasA.height);
+            ctxA.drawImage(rawCanvas, 0, 0);
+            
+            ctxA.strokeStyle = '#007bff';
+            ctxA.lineWidth = 2;
+            ctxA.strokeRect(startX, startY, currX - startX, currY - startY);
+        };
+        
+        canvasA.onmouseup = (e) => {
+            if (!isDrawing) return;
+            isDrawing = false;
+            
+            const rect = canvasA.getBoundingClientRect();
+            const endX = (e.clientX - rect.left) * (canvasA.width / rect.width);
+            const endY = (e.clientY - rect.top) * (canvasA.height / rect.height);
+            
+            rectX = Math.round(Math.min(startX, endX));
+            rectY = Math.round(Math.min(startY, endY));
+            rectW = Math.round(Math.abs(endX - startX));
+            rectH = Math.round(Math.abs(endY - startY));
+
+            ctxA.clearRect(0, 0, canvasA.width, canvasA.height);
+            ctxA.drawImage(rawCanvas, 0, 0);
+        };
+    }
+
+    function processEncrypt() {
+        if (!rectW || !rectH) { alert('範囲を指定してください。'); return; }
+
+        const qx = Math.floor(rectX + (rectW - QR_FIXED_SIZE) / 2);
+        const qy = Math.floor(rectY + (rectH - QR_FIXED_SIZE) / 2);
+
+        const hiddenImgData = rawCtx.getImageData(qx, qy, QR_FIXED_SIZE, QR_FIXED_SIZE);
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = QR_FIXED_SIZE;
+        tempCanvas.height = QR_FIXED_SIZE;
+        tempCanvas.getContext('2d').putImageData(hiddenImgData, 0, 0);
+        const hiddenPngB64 = tempCanvas.toDataURL('image/png').split(',')[1];
+
+        const fullImgData = ctxA.getImageData(rectX, rectY, rectW, rectH);
+        const pixels = fullImgData.data;
+        const rng = createPRNG(FIXED_SEED);
+        for (let i = 0; i < pixels.length; i += 4) {
+            pixels[i]     ^= Math.floor(rng() * 256);
+            pixels[i + 1] ^= Math.floor(rng() * 256);
+            pixels[i + 2] ^= Math.floor(rng() * 256);
+        }
+        ctxA.putImageData(fullImgData, rectX, rectY);
+
+        const metaStr = `${rectX}|${rectY}|${rectW}|${rectH}|${hiddenPngB64}`;
+
+        const qr = qrcode(4, 'L');
+        qr.addData("COMPLIANCE_PROTECTED_IMAGE");
+        qr.make();
+        
+        const qrImg = new Image();
+        qrImg.onload = function() {
+            ctxA.drawImage(qrImg, qx, qy, QR_FIXED_SIZE, QR_FIXED_SIZE);
+            
+            const base64Canvas = canvasA.toDataURL('image/png');
+            const rawBin = atob(base64Canvas.split(',')[1]);
+            const array = new Uint8Array(rawBin.length);
+            for (let i = 0; i < rawBin.length; i++) {
+                array[i] = rawBin.charCodeAt(i);
+            }
+
+            const encoder = new TextEncoder();
+            const metaBin = encoder.encode("##META_START##" + metaStr + "##META_END##");
+            
+            const finalBin = new Uint8Array(array.length + metaBin.length);
+            finalBin.set(array, 0);
+            finalBin.set(metaBin, array.length);
+
+            const blob = new Blob([finalBin], {type: 'image/png'});
+            const link = document.createElement('a');
+            link.download = 'compliance_secured.png';
+            link.href = URL.createObjectURL(blob);
+            link.click();
+        };
+        qrImg.src = qr.createDataURL(4, 0);
+    }
+
+    // パターンB (復元側)
+    const canvasB = document.getElementById('canvas-B');
+    const ctxB = canvasB.getContext('2d');
+
+    function handleFileB(file) {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const arrayBuffer = e.target.result;
+            const view = new Uint8Array(arrayBuffer);
+            const decoder = new TextDecoder();
+            const fullText = decoder.decode(view);
+
+            const startIdx = fullText.lastIndexOf("##META_START##");
+            const endIdx = fullText.lastIndexOf("##META_END##");
+
+            if (startIdx === -1 || endIdx === -1) {
+                alert("画像ファイルから復元用データが検出できませんでした。");
+                return;
+            }
+
+            const metaStr = fullText.substring(startIdx + 14, endIdx);
+
+            const blob = new Blob([arrayBuffer], {type: 'image/png'});
+            const imgUrl = URL.createObjectURL(blob);
+            const img = new Image();
+            img.onload = function() {
+                canvasB.width = img.width;
+                canvasB.height = img.height;
+                ctxB.drawImage(img, 0, 0);
+                processDecrypt(metaStr);
+            };
+            img.src = imgUrl;
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    function processDecrypt(metaStr) {
+        try {
+            const parts = metaStr.split('|');
+            if (parts.length !== 5) { throw new Error('データ破損'); }
+            
+            const rx = parseInt(parts[0]);
+            const ry = parseInt(parts[1]);
+            const rw = parseInt(parts[2]);
+            const rh = parseInt(parts[3]);
+            const hiddenPngB64 = parts[4];
+            
+            const fullImgData = ctxB.getImageData(rx, ry, rw, rh);
+            const pixels = fullImgData.data;
+            const rng = createPRNG(FIXED_SEED);
+            for (let i = 0; i < pixels.length; i += 4) {
+                pixels[i]     ^= Math.floor(rng() * 256);
+                pixels[i + 1] ^= Math.floor(rng() * 256);
+                pixels[i + 2] ^= Math.floor(rng() * 256);
+            }
+            ctxB.putImageData(fullImgData, rx, ry);
+
+            const qx = Math.floor(rx + (rw - QR_FIXED_SIZE) / 2);
+            const qy = Math.floor(ry + (rh - QR_FIXED_SIZE) / 2);
+            
+            const hiddenImg = new Image();
+            hiddenImg.onload = function() {
+                ctxB.drawImage(hiddenImg, qx, qy);
+            };
+            hiddenImg.src = 'data:image/png;base64,' + hiddenPngB64;
+
+        } catch (e) {
+            alert('復元処理中にエラーが発生しました。');
+            console.error(e);
+        }
+    }
+</script>
+</body>
+</html>
